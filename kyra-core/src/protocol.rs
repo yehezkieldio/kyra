@@ -59,3 +59,4 @@ impl Packet {
 
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
+pub const CHUNK_SIZE: usize = 64 * 1024; // 64 KB
