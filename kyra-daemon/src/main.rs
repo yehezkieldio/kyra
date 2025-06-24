@@ -65,6 +65,22 @@ async fn handle_connection(stream: TokioTcpStream) -> Result<()> {
                                 println!("Received Error: {}", err);
                                 continue;
                             }
+                            Message::FileMetadata { name, size } => {
+                                println!("Received FileMetadata: name={}, size={}", name, size);
+                                Packet::file_metadata(name, size)
+                            }
+                            Message::FileChunk(data) => {
+                                println!("Received FileChunk of size: {}", data.len());
+                                Packet::file_chunk(data)
+                            }
+                            Message::FileComplete => {
+                                println!("Received FileComplete");
+                                Packet::file_complete()
+                            }
+                            Message::ClipboardText(text) => {
+                                println!("Received ClipboardText: {}", text);
+                                Packet::clipboard_text(text)
+                            }
                         };
 
                         let response_json = serde_json::to_string(&response)?;
