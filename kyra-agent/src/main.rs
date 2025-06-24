@@ -125,9 +125,9 @@ fn build_cli() -> Command {
 fn init_logging(config: &AgentConfig) -> Result<()> {
     let subscriber = fmt()
         .with_target(false)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true);
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false);
 
     if let Some(log_file) = &config.logging.file {
         if let Some(parent) = log_file.parent() {

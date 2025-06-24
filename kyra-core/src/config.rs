@@ -128,7 +128,7 @@ impl Default for LoggingConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            enable_mdns: true,
+            enable_mdns: false,
             service_name: crate::MDNS_SERVICE_NAME.to_string(),
             fallback_hosts: vec!["127.0.0.1".to_string()],
             announce_interval: 30,

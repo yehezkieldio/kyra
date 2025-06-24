@@ -51,7 +51,6 @@ async fn main() -> Result<()> {
     init_logging(&config)?;
 
     info!("🚀 Starting Kyra Daemon v0.1.0");
-    info!("Configuration loaded: {:?}", config);
 
     // Ensure download directory exists
     ensure_dir_exists(&config.storage.download_dir).await?;
@@ -156,9 +155,9 @@ async fn main() -> Result<()> {
 fn init_logging(config: &DaemonConfig) -> Result<()> {
     let subscriber = fmt()
         .with_target(false)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true);
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false);
 
     if let Some(log_file) = &config.logging.file {
         if let Some(parent) = log_file.parent() {
