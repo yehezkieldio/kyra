@@ -1,6 +1,6 @@
 use anyhow::Result;
 use arboard::Clipboard;
-use kyra_core::{DEFAULT_HOST, DEFAULT_PORT, Message, Packet};
+use kyra_core::{DaemonConfig, Message, Packet};
 use serde_json;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 struct FileTransfer {
@@ -23,36 +24,74 @@ type ActiveTransfers = Arc<Mutex<HashMap<String, FileTransfer>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("Starting Kyra Daemon...");
+    // Load configuration
+    let config = DaemonConfig::load()?;
 
-    let addr = format!("{}:{}", DEFAULT_HOST, DEFAULT_PORT);
+    // Initialize logging
+    init_logging(&config)?;
+
+    info!("Starting Kyra Daemon...");
+    info!("Configuration loaded: {:?}", config);
+
+    let addr = format!("{}:{}", config.network.host, config.network.port);
     let listener = TokioTcpListener::bind(&addr).await?;
 
-    println!("Daemon listening on {}", addr);
+    info!("Daemon listening on {}", addr);
 
     let active_transfers: ActiveTransfers = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                println!("New connection from: {}", addr);
+                info!("New connection from: {}", addr);
                 let transfers = active_transfers.clone();
+                let config = config.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, transfers).await {
-                        eprintln!("Error handling connection: {}", e);
+                    if let Err(e) = handle_connection(stream, transfers, config).await {
+                        error!("Error handling connection from {}: {}", addr, e);
                     }
                 });
             }
             Err(e) => {
-                eprintln!("Error accepting connection: {}", e);
+                error!("Error accepting connection: {}", e);
             }
         }
     }
 }
 
+fn init_logging(config: &DaemonConfig) -> Result<()> {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let filter =
+        EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(&config.logging.level))?;
+
+    let subscriber = fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true);
+
+    if let Some(log_file) = &config.logging.file {
+        if let Some(parent) = log_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)?;
+        subscriber.with_writer(file).init();
+    } else {
+        subscriber.init();
+    }
+
+    Ok(())
+}
+
 async fn handle_connection(
     stream: TokioTcpStream,
     active_transfers: ActiveTransfers,
+    config: DaemonConfig,
 ) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
     let (read_half, mut write_half) = stream.into_split();
@@ -67,16 +106,18 @@ async fn handle_connection(
             .as_millis()
     );
 
-    println!("Client ID: {}", client_id);
+    info!("Client connected with ID: {}", client_id);
 
     loop {
         line.clear();
         match reader.read_line(&mut line).await? {
             0 => {
-                println!("Client disconnected: {}", peer_addr);
+                info!("Client disconnected: {}", peer_addr);
                 // Clean up any active transfers for this client
                 let mut transfers = active_transfers.lock().await;
-                transfers.remove(&client_id);
+                if transfers.remove(&client_id).is_some() {
+                    warn!("Cleaned up incomplete transfer for client: {}", client_id);
+                }
                 break;
             }
             _ => {
@@ -85,41 +126,47 @@ async fn handle_connection(
                     continue;
                 }
 
+                debug!("Raw message from {}: {}", peer_addr, trimmed);
+
                 match serde_json::from_str::<Packet>(trimmed) {
                     Ok(packet) => {
-                        println!("Received packet from {}: {:?}", peer_addr, packet);
+                        debug!("Received packet from {}: {:?}", peer_addr, packet.message);
 
-                        let response =
-                            match handle_message(packet.message, &client_id, &active_transfers)
-                                .await
-                            {
-                                Ok(response_msg) => response_msg,
-                                Err(e) => {
-                                    eprintln!("Error handling message from {}: {}", peer_addr, e);
-                                    Some(Packet::error(format!("Error: {}", e)))
-                                }
-                            };
+                        let response = match handle_message(
+                            packet.message,
+                            &client_id,
+                            &active_transfers,
+                            &config,
+                        )
+                        .await
+                        {
+                            Ok(response_msg) => response_msg,
+                            Err(e) => {
+                                error!("Error handling message from {}: {}", peer_addr, e);
+                                Some(Packet::error(format!("Error: {}", e)))
+                            }
+                        };
 
                         if let Some(response) = response {
                             let response_json = serde_json::to_string(&response)?;
                             // Handle broken pipe gracefully
                             if let Err(e) = write_half.write_all(response_json.as_bytes()).await {
                                 if e.kind() == std::io::ErrorKind::BrokenPipe {
-                                    println!("Client {} disconnected during response", peer_addr);
+                                    info!("Client {} disconnected during response", peer_addr);
                                     break;
                                 }
                                 return Err(e.into());
                             }
                             if let Err(e) = write_half.write_all(b"\n").await {
                                 if e.kind() == std::io::ErrorKind::BrokenPipe {
-                                    println!("Client {} disconnected during response", peer_addr);
+                                    info!("Client {} disconnected during response", peer_addr);
                                     break;
                                 }
                                 return Err(e.into());
                             }
                             if let Err(e) = write_half.flush().await {
                                 if e.kind() == std::io::ErrorKind::BrokenPipe {
-                                    println!("Client {} disconnected during response", peer_addr);
+                                    info!("Client {} disconnected during response", peer_addr);
                                     break;
                                 }
                                 return Err(e.into());
@@ -127,27 +174,27 @@ async fn handle_connection(
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to deserialize message from {}: {}", peer_addr, e);
+                        error!("Failed to deserialize message from {}: {}", peer_addr, e);
                         let error_packet = Packet::error(format!("Invalid message format: {}", e));
                         let error_json = serde_json::to_string(&error_packet)?;
                         // Handle broken pipe gracefully
                         if let Err(write_err) = write_half.write_all(error_json.as_bytes()).await {
                             if write_err.kind() == std::io::ErrorKind::BrokenPipe {
-                                println!("Client {} disconnected during error response", peer_addr);
+                                info!("Client {} disconnected during error response", peer_addr);
                                 break;
                             }
                             return Err(write_err.into());
                         }
                         if let Err(write_err) = write_half.write_all(b"\n").await {
                             if write_err.kind() == std::io::ErrorKind::BrokenPipe {
-                                println!("Client {} disconnected during error response", peer_addr);
+                                info!("Client {} disconnected during error response", peer_addr);
                                 break;
                             }
                             return Err(write_err.into());
                         }
                         if let Err(write_err) = write_half.flush().await {
                             if write_err.kind() == std::io::ErrorKind::BrokenPipe {
-                                println!("Client {} disconnected during error response", peer_addr);
+                                info!("Client {} disconnected during error response", peer_addr);
                                 break;
                             }
                             return Err(write_err.into());
@@ -169,22 +216,26 @@ async fn handle_message(
     message: Message,
     client_id: &str,
     active_transfers: &ActiveTransfers,
+    config: &DaemonConfig,
 ) -> Result<Option<Packet>> {
     match message {
         Message::Ping => {
-            println!("Received Ping, sending Pong");
+            debug!("Received Ping from {}, sending Pong", client_id);
             Ok(Some(Packet::pong()))
         }
         Message::Pong => {
-            println!("Received Pong");
+            debug!("Received Pong from {}", client_id);
             Ok(None)
         }
         Message::FileMetadata { name, size } => {
-            println!("Starting file transfer: {} ({} bytes)", name, size);
+            info!(
+                "Starting file transfer from {}: {} ({} bytes)",
+                client_id, name, size
+            );
 
-            // Create downloads directory if it doesn't exist
-            let downloads_dir = PathBuf::from("downloads");
-            std::fs::create_dir_all(&downloads_dir)?;
+            // Use configured download directory
+            let downloads_dir = &config.storage.download_dir;
+            std::fs::create_dir_all(downloads_dir)?;
 
             // Create file path
             let file_path = downloads_dir.join(&name);
@@ -207,7 +258,7 @@ async fn handle_message(
             let mut transfers = active_transfers.lock().await;
             transfers.insert(client_id.to_string(), transfer);
 
-            println!("Ready to receive file: {} -> {:?}", name, file_path);
+            info!("Ready to receive file: {} -> {:?}", name, file_path);
             Ok(Some(Packet::pong())) // Acknowledge metadata
         }
         Message::FileChunk(data) => {
@@ -220,11 +271,10 @@ async fn handle_message(
                 transfer.received += data.len() as u64;
 
                 let progress = (transfer.received as f64 / transfer.size as f64) * 100.0;
-                println!(
-                    "Received chunk for {}: {} / {} bytes ({:.1}%)",
-                    transfer.name, transfer.received, transfer.size, progress
+                debug!(
+                    "Received chunk for {} from {}: {} / {} bytes ({:.1}%)",
+                    transfer.name, client_id, transfer.received, transfer.size, progress
                 );
-
                 Ok(None) // Don't send response for chunks
             } else {
                 Err(anyhow::anyhow!("No active file transfer for this client"))
@@ -238,15 +288,15 @@ async fn handle_message(
                 drop(transfer.file);
 
                 if transfer.received == transfer.size {
-                    println!(
-                        "File transfer completed successfully: {} ({} bytes)",
-                        transfer.name, transfer.received
+                    info!(
+                        "File transfer completed successfully from {}: {} ({} bytes)",
+                        client_id, transfer.name, transfer.received
                     );
                     Ok(Some(Packet::pong()))
                 } else {
-                    println!(
-                        "File transfer completed with size mismatch: {} (expected: {}, received: {})",
-                        transfer.name, transfer.size, transfer.received
+                    warn!(
+                        "File transfer completed with size mismatch from {}: {} (expected: {}, received: {})",
+                        client_id, transfer.name, transfer.size, transfer.received
                     );
                     Ok(Some(Packet::error(format!(
                         "Size mismatch: expected {}, received {}",
@@ -258,19 +308,41 @@ async fn handle_message(
             }
         }
         Message::ClipboardText(text) => {
-            println!("Received clipboard text: {} characters", text.len());
-            println!("Clipboard content: {}", text);
+            info!(
+                "Received clipboard text from {}: {} characters",
+                client_id,
+                text.len()
+            );
+            debug!("Clipboard content: {}", text);
 
-            let mut clipboard = Clipboard::new().unwrap();
-            clipboard.set_text(text).unwrap();
-            println!("Clipboard text set successfully");
+            match Clipboard::new() {
+                Ok(mut clipboard) => {
+                    if let Err(e) = clipboard.set_text(text) {
+                        error!("Failed to set clipboard: {}", e);
+                        return Ok(Some(Packet::error(format!(
+                            "Failed to set clipboard: {}",
+                            e
+                        ))));
+                    }
+                    info!("Clipboard text set successfully");
 
-            notifica::notify("Kyra", "Clipboard text updated!").unwrap();
+                    if let Err(e) = notifica::notify("Kyra", "Clipboard text updated!") {
+                        warn!("Failed to send notification: {}", e);
+                    }
 
-            Ok(Some(Packet::pong()))
+                    Ok(Some(Packet::pong()))
+                }
+                Err(e) => {
+                    error!("Failed to access clipboard: {}", e);
+                    Ok(Some(Packet::error(format!(
+                        "Failed to access clipboard: {}",
+                        e
+                    ))))
+                }
+            }
         }
         Message::Error(ref err) => {
-            println!("Received Error: {}", err);
+            warn!("Received Error from {}: {}", client_id, err);
             Ok(None)
         }
     }
