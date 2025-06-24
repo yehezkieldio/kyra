@@ -1,15 +1,23 @@
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
-use kyra_core::{CHUNK_SIZE, DEFAULT_HOST, DEFAULT_PORT, Message, Packet};
+use kyra_core::{AgentConfig, CHUNK_SIZE, Message, Packet};
 use serde_json;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::TcpStream;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::fmt;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load configuration
+    let config = AgentConfig::load()?;
+
+    // Initialize logging
+    init_logging(&config)?;
+
     let matches = Command::new("kyra-agent")
         .about("Kyra Agent - Client for data transfer")
         .subcommand(Command::new("ping").about("Send a ping to the daemon"))
@@ -37,58 +45,81 @@ async fn main() -> Result<()> {
 
     match matches.subcommand() {
         Some(("ping", _)) => {
-            send_ping().await?;
+            send_ping(&config).await?;
         }
         Some(("send", send_matches)) => match send_matches.subcommand() {
             Some(("file", file_matches)) => {
                 let file_path = file_matches.get_one::<String>("path").unwrap();
-                send_file(file_path).await?;
+                send_file(file_path, &config).await?;
             }
             Some(("clipboard", clipboard_matches)) => {
                 let text = clipboard_matches.get_one::<String>("text").unwrap();
-                send_clipboard_text(text).await?;
+                send_clipboard_text(text, &config).await?;
             }
             _ => {
-                eprintln!("Unknown send command. Use 'file' or 'clipboard'");
+                error!("Unknown send command. Use 'file' or 'clipboard'");
             }
         },
         _ => {
-            eprintln!("No command specified. Use 'ping' or 'send'");
+            error!("No command specified. Use 'ping' or 'send'");
         }
     }
 
     Ok(())
 }
 
-async fn send_ping() -> Result<()> {
-    println!("Starting Kyra Agent - Ping...");
+fn init_logging(config: &AgentConfig) -> Result<()> {
+    let subscriber = fmt()
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true);
 
-    let addr = format!("{}:{}", DEFAULT_HOST, DEFAULT_PORT);
-    println!("Connecting to daemon at {}", addr);
-
-    let mut stream = TcpStream::connect(&addr)
-        .await
-        .context("Failed to connect to daemon")?;
-    println!("Connected to daemon!");
-
-    // Send ping
-    let ping_packet = Packet::ping();
-    send_packet(&mut stream, &ping_packet).await?;
-    println!("Sent ping: {:?}", ping_packet);
-
-    // Wait for response
-    let response = receive_packet(&mut stream).await?;
-    match response.message {
-        Message::Pong => println!("Successfully received Pong!"),
-        Message::Error(err) => println!("Daemon returned error: {}", err),
-        _ => println!("Unexpected response: {:?}", response.message),
+    if let Some(log_file) = &config.logging.file {
+        if let Some(parent) = log_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)?;
+        subscriber.with_writer(file).init();
+    } else {
+        subscriber.init();
     }
 
     Ok(())
 }
 
-async fn send_file(file_path: &str) -> Result<()> {
-    println!("Starting Kyra Agent - File Transfer...");
+async fn send_ping(config: &AgentConfig) -> Result<()> {
+    info!("Starting Kyra Agent - Ping...");
+
+    let addr = format!("{}:{}", config.network.host, config.network.port);
+    info!("Connecting to daemon at {}", addr);
+
+    let mut stream = TcpStream::connect(&addr)
+        .await
+        .context("Failed to connect to daemon")?;
+    info!("Connected to daemon!");
+
+    // Send ping
+    let ping_packet = Packet::ping();
+    send_packet(&mut stream, &ping_packet).await?;
+    debug!("Sent ping: {:?}", ping_packet);
+
+    // Wait for response
+    let response = receive_packet(&mut stream).await?;
+    match response.message {
+        Message::Pong => info!("Successfully received Pong!"),
+        Message::Error(err) => error!("Daemon returned error: {}", err),
+        _ => warn!("Unexpected response: {:?}", response.message),
+    }
+
+    Ok(())
+}
+
+async fn send_file(file_path: &str, config: &AgentConfig) -> Result<()> {
+    info!("Starting Kyra Agent - File Transfer...");
 
     let path = Path::new(file_path);
     if !path.exists() {
@@ -106,18 +137,18 @@ async fn send_file(file_path: &str) -> Result<()> {
         .context("Failed to get file metadata")?
         .len();
 
-    println!("Sending file: {} ({} bytes)", file_name, file_size);
+    info!("Sending file: {} ({} bytes)", file_name, file_size);
 
-    let addr = format!("{}:{}", DEFAULT_HOST, DEFAULT_PORT);
+    let addr = format!("{}:{}", config.network.host, config.network.port);
     let mut stream = TcpStream::connect(&addr)
         .await
         .context("Failed to connect to daemon")?;
-    println!("Connected to daemon!");
+    info!("Connected to daemon!");
 
     // Send file metadata
     let metadata_packet = Packet::file_metadata(file_name.clone(), file_size);
     send_packet(&mut stream, &metadata_packet).await?;
-    println!("Sent file metadata: {} ({} bytes)", file_name, file_size);
+    info!("Sent file metadata: {} ({} bytes)", file_name, file_size);
 
     // Wait for acknowledgment
     let (reader, mut writer) = stream.split();
@@ -132,7 +163,7 @@ async fn send_file(file_path: &str) -> Result<()> {
         serde_json::from_str::<Packet>(trimmed).context("Failed to deserialize response")?;
 
     match ack_response.message {
-        Message::Pong => println!("Metadata acknowledged"),
+        Message::Pong => info!("Metadata acknowledged"),
         Message::Error(err) => return Err(anyhow::anyhow!("Daemon error: {}", err)),
         _ => {
             return Err(anyhow::anyhow!(
@@ -144,7 +175,6 @@ async fn send_file(file_path: &str) -> Result<()> {
 
     // Open file and send chunks
     let mut file = File::open(path).context("Failed to open file")?;
-
     let mut buffer = vec![0u8; CHUNK_SIZE];
     let mut bytes_sent = 0u64;
 
@@ -170,11 +200,10 @@ async fn send_file(file_path: &str) -> Result<()> {
         writer.flush().await.context("Failed to flush stream")?;
 
         bytes_sent += bytes_read as u64;
-        println!(
+        let progress = (bytes_sent as f64 / file_size as f64) * 100.0;
+        debug!(
             "Sent chunk: {} / {} bytes ({:.1}%)",
-            bytes_sent,
-            file_size,
-            (bytes_sent as f64 / file_size as f64) * 100.0
+            bytes_sent, file_size, progress
         );
     }
 
@@ -202,7 +231,7 @@ async fn send_file(file_path: &str) -> Result<()> {
         serde_json::from_str::<Packet>(trimmed).context("Failed to deserialize final response")?;
 
     match final_response.message {
-        Message::Pong => println!("File transfer completed successfully!"),
+        Message::Pong => info!("File transfer completed successfully!"),
         Message::Error(err) => return Err(anyhow::anyhow!("Daemon error: {}", err)),
         _ => {
             return Err(anyhow::anyhow!(
@@ -215,25 +244,25 @@ async fn send_file(file_path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn send_clipboard_text(text: &str) -> Result<()> {
-    println!("Starting Kyra Agent - Clipboard Transfer...");
+async fn send_clipboard_text(text: &str, config: &AgentConfig) -> Result<()> {
+    info!("Starting Kyra Agent - Clipboard Transfer...");
 
-    let addr = format!("{}:{}", DEFAULT_HOST, DEFAULT_PORT);
+    let addr = format!("{}:{}", config.network.host, config.network.port);
     let mut stream = TcpStream::connect(&addr)
         .await
         .context("Failed to connect to daemon")?;
-    println!("Connected to daemon!");
+    info!("Connected to daemon!");
 
     let clipboard_packet = Packet::clipboard_text(text.to_string());
     send_packet(&mut stream, &clipboard_packet).await?;
-    println!("Sent clipboard text ({} characters)", text.len());
+    info!("Sent clipboard text ({} characters)", text.len());
 
     // Wait for acknowledgment
     let response = receive_packet(&mut stream).await?;
     match response.message {
-        Message::Pong => println!("Clipboard text sent successfully!"),
-        Message::Error(err) => println!("Daemon returned error: {}", err),
-        _ => println!("Unexpected response: {:?}", response.message),
+        Message::Pong => info!("Clipboard text sent successfully!"),
+        Message::Error(err) => error!("Daemon returned error: {}", err),
+        _ => warn!("Unexpected response: {:?}", response.message),
     }
 
     Ok(())
