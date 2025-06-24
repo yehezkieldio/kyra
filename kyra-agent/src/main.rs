@@ -23,7 +23,13 @@ async fn main() -> Result<()> {
 
     match matches.subcommand() {
         Some(("discover", _)) => {
-            discover_peers(&config).await?;
+            if config.discovery.enable_mdns {
+                discover_peers(&config).await?;
+            } else {
+                error!(
+                    "mDNS discovery is disabled in the configuration. Enable it to use this command."
+                );
+            }
         }
         Some(("ping", ping_matches)) => {
             let host = ping_matches.get_one::<String>("host");
