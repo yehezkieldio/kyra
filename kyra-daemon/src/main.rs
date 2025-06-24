@@ -208,13 +208,13 @@ async fn handle_message(
             println!("Received clipboard text: {} characters", text.len());
             println!("Clipboard content: {}", text);
 
-            // In a real implementation, might want to set the system clipboard here
-            // For now, we'll just acknowledge receipt
             let mut clipboard = Clipboard::new().unwrap();
             clipboard.set_text(text).unwrap();
             println!("Clipboard text set successfully");
 
-            Ok(Some(Packet::pong()))
+            notifica::notify("Kyra", "Clipboard text updated!").unwrap();
+
+            Ok(None)
         }
         Message::Error(ref err) => {
             println!("Received Error: {}", err);
