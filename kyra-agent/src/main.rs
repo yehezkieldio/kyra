@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
-use kyra_core::{
-    AgentConfig, CHUNK_SIZE, Message, Packet
-};
+use kyra_core::{AgentConfig, CHUNK_SIZE, Message, Packet};
 use serde_json;
 use std::fs::File;
 use std::io::Read;
@@ -51,10 +49,7 @@ fn build_cli() -> Command {
     Command::new("kyra-agent")
         .version("0.1.0")
         .about("Kyra Agent - Secure cross-platform data transfer client")
-        .subcommand(
-            Command::new("discover")
-                .about("Discover Kyra peers on the network")
-        )
+        .subcommand(Command::new("discover").about("Discover Kyra peers on the network"))
         .subcommand(
             Command::new("ping")
                 .about("Send a ping to test connectivity")
@@ -62,8 +57,8 @@ fn build_cli() -> Command {
                     Arg::new("host")
                         .help("Specific host to ping (optional, will use discovery)")
                         .long("host")
-                        .value_name("HOST")
-                )
+                        .value_name("HOST"),
+                ),
         )
         .subcommand(
             Command::new("send")
@@ -75,14 +70,14 @@ fn build_cli() -> Command {
                             Arg::new("path")
                                 .help("Path to the file to send")
                                 .required(true)
-                                .index(1)
+                                .index(1),
                         )
                         .arg(
                             Arg::new("host")
                                 .help("Target host")
                                 .long("host")
-                                .value_name("HOST")
-                        )
+                                .value_name("HOST"),
+                        ),
                 )
                 .subcommand(
                     Command::new("clipboard")
@@ -91,8 +86,8 @@ fn build_cli() -> Command {
                             Arg::new("host")
                                 .help("Target host")
                                 .long("host")
-                                .value_name("HOST")
-                        )
+                                .value_name("HOST"),
+                        ),
                 )
                 .subcommand(
                     Command::new("text")
@@ -101,15 +96,15 @@ fn build_cli() -> Command {
                             Arg::new("message")
                                 .help("Text message to send")
                                 .required(true)
-                                .index(1)
+                                .index(1),
                         )
                         .arg(
                             Arg::new("host")
                                 .help("Target host")
                                 .long("host")
-                                .value_name("HOST")
-                        )
-                )
+                                .value_name("HOST"),
+                        ),
+                ),
         )
         .subcommand(
             Command::new("auth")
@@ -121,9 +116,9 @@ fn build_cli() -> Command {
                             Arg::new("passphrase")
                                 .help("Passphrase to generate token from")
                                 .required(true)
-                                .index(1)
-                        )
-                )
+                                .index(1),
+                        ),
+                ),
         )
 }
 
@@ -306,6 +301,7 @@ async fn send_file(file_path: &str, config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn send_clipboard_text(text: &str, config: &AgentConfig) -> Result<()> {
     info!("Starting Kyra Agent - Clipboard Transfer...");
 

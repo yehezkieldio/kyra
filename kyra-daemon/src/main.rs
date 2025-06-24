@@ -1,9 +1,8 @@
 use anyhow::Result;
 use arboard::{Clipboard, ImageData};
 use kyra_core::{
-    DaemonConfig, DiscoveryService, Message, Packet,
-    generate_checksum, is_host_allowed, load_tls_server_config,
-    sanitize_filename, format_bytes, ensure_dir_exists
+    DaemonConfig, DiscoveryService, Message, Packet, ensure_dir_exists, format_bytes,
+    generate_checksum, is_host_allowed, load_tls_server_config, sanitize_filename,
 };
 use serde_json;
 use std::collections::HashMap;
@@ -24,6 +23,7 @@ struct FileTransfer {
     size: u64,
     received: u64,
     file: File,
+    #[allow(dead_code)]
     checksum: Option<String>,
     chunks_received: u64,
     total_chunks: u64,
@@ -32,7 +32,9 @@ struct FileTransfer {
 
 #[derive(Debug)]
 struct ClientSession {
+    #[allow(dead_code)]
     id: String,
+    #[allow(dead_code)]
     addr: SocketAddr,
     authenticated: bool,
     file_transfer: Option<FileTransfer>,
@@ -112,19 +114,23 @@ async fn main() -> Result<()> {
                     // Insert new session
                     {
                         let mut sessions_guard = sessions.lock().await;
-                        sessions_guard.insert(session_id.clone(), ClientSession {
-                            id: session_id.clone(),
-                            addr,
-                            authenticated: !config.security.require_auth,
-                            file_transfer: None,
-                        });
+                        sessions_guard.insert(
+                            session_id.clone(),
+                            ClientSession {
+                                id: session_id.clone(),
+                                addr,
+                                authenticated: !config.security.require_auth,
+                                file_transfer: None,
+                            },
+                        );
                     }
 
                     let result = if let Some(ref acceptor) = tls_acceptor {
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 info!("🔐 TLS handshake completed for {}", addr);
-                                handle_connection_tls(tls_stream, session_id, sessions, config).await
+                                handle_connection_tls(tls_stream, session_id, sessions, config)
+                                    .await
                             }
                             Err(e) => {
                                 error!("❌ TLS handshake failed for {}: {}", addr, e);
@@ -225,12 +231,8 @@ where
                     Ok(packet) => {
                         debug!("📦 Received packet: {:?}", packet.message);
 
-                        let response = handle_message(
-                            packet,
-                            &session_id,
-                            &sessions,
-                            &config,
-                        ).await;
+                        let response =
+                            handle_message(packet, &session_id, &sessions, &config).await;
 
                         match response {
                             Ok(Some(response_packet)) => {
@@ -281,7 +283,8 @@ async fn handle_message(
     config: &DaemonConfig,
 ) -> Result<Option<Packet>> {
     let mut sessions_guard = sessions.lock().await;
-    let session = sessions_guard.get_mut(session_id)
+    let session = sessions_guard
+        .get_mut(session_id)
         .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
     match packet.message {
@@ -313,7 +316,12 @@ async fn handle_message(
             debug!("🏓 Pong from session {}", session_id);
             Ok(None)
         }
-        Message::FileMetadata { name, size, checksum, compressed: _ } => {
+        Message::FileMetadata {
+            name,
+            size,
+            checksum,
+            compressed: _,
+        } => {
             if size > config.storage.max_file_size {
                 return Ok(Some(Packet::error(format!(
                     "File too large: {} > {}",
@@ -325,8 +333,12 @@ async fn handle_message(
             let sanitized_name = sanitize_filename(&name);
             let file_path = config.storage.download_dir.join(&sanitized_name);
 
-            info!("📁 Starting file transfer: {} ({}) -> {}",
-                  name, format_bytes(size), file_path.display());
+            info!(
+                "📁 Starting file transfer: {} ({}) -> {}",
+                name,
+                format_bytes(size),
+                file_path.display()
+            );
 
             let file = OpenOptions::new()
                 .create(true)
@@ -348,7 +360,11 @@ async fn handle_message(
             session.file_transfer = Some(transfer);
             Ok(Some(Packet::success("Ready to receive file".to_string())))
         }
-        Message::FileChunk { data, sequence, total_chunks } => {
+        Message::FileChunk {
+            data,
+            sequence,
+            total_chunks,
+        } => {
             if let Some(transfer) = &mut session.file_transfer {
                 transfer.file.write_all(&data)?;
                 transfer.file.flush()?;
@@ -360,12 +376,15 @@ async fn handle_message(
                 let elapsed = transfer.start_time.elapsed();
                 let speed = transfer.received as f64 / elapsed.as_secs_f64();
 
-                debug!("📊 File chunk {}/{}: {} / {} ({:.1}%) at {}/s",
-                       sequence, total_chunks,
-                       format_bytes(transfer.received),
-                       format_bytes(transfer.size),
-                       progress,
-                       format_bytes(speed as u64));
+                debug!(
+                    "📊 File chunk {}/{}: {} / {} ({:.1}%) at {}/s",
+                    sequence,
+                    total_chunks,
+                    format_bytes(transfer.received),
+                    format_bytes(transfer.size),
+                    progress,
+                    format_bytes(speed as u64)
+                );
 
                 Ok(None)
             } else {
@@ -380,11 +399,13 @@ async fn handle_message(
                 let speed = transfer.received as f64 / elapsed.as_secs_f64();
 
                 if transfer.received == transfer.size {
-                    info!("✅ File transfer completed: {} ({}) in {:.1}s at {}/s",
-                          transfer.name,
-                          format_bytes(transfer.received),
-                          elapsed.as_secs_f64(),
-                          format_bytes(speed as u64));
+                    info!(
+                        "✅ File transfer completed: {} ({}) in {:.1}s at {}/s",
+                        transfer.name,
+                        format_bytes(transfer.received),
+                        elapsed.as_secs_f64(),
+                        format_bytes(speed as u64)
+                    );
 
                     // Verify checksum if provided
                     if let Some(expected_checksum) = checksum {
@@ -393,23 +414,33 @@ async fn handle_message(
                         let actual_checksum = generate_checksum(&file_data);
 
                         if actual_checksum != expected_checksum {
-                            warn!("⚠️  Checksum mismatch for {}: expected {}, got {}",
-                                  transfer.name, expected_checksum, actual_checksum);
-                            return Ok(Some(Packet::error("Checksum verification failed".to_string())));
+                            warn!(
+                                "⚠️  Checksum mismatch for {}: expected {}, got {}",
+                                transfer.name, expected_checksum, actual_checksum
+                            );
+                            return Ok(Some(Packet::error(
+                                "Checksum verification failed".to_string(),
+                            )));
                         }
 
                         info!("✅ Checksum verified for {}", transfer.name);
                     }
 
                     // Send notification
-                    if let Err(e) = notifica::notify("Kyra", &format!("File received: {}", transfer.name)) {
+                    if let Err(e) =
+                        notifica::notify("Kyra", &format!("File received: {}", transfer.name))
+                    {
                         warn!("⚠️  Failed to send notification: {}", e);
                     }
 
-                    Ok(Some(Packet::success("File received successfully".to_string())))
+                    Ok(Some(Packet::success(
+                        "File received successfully".to_string(),
+                    )))
                 } else {
-                    warn!("⚠️  File size mismatch: expected {}, received {}",
-                          transfer.size, transfer.received);
+                    warn!(
+                        "⚠️  File size mismatch: expected {}, received {}",
+                        transfer.size, transfer.received
+                    );
                     Ok(Some(Packet::error(format!(
                         "Size mismatch: expected {}, received {}",
                         transfer.size, transfer.received
@@ -426,7 +457,10 @@ async fn handle_message(
                 Ok(mut clipboard) => {
                     if let Err(e) = clipboard.set_text(text) {
                         error!("❌ Failed to set clipboard text: {}", e);
-                        return Ok(Some(Packet::error(format!("Failed to set clipboard: {}", e))));
+                        return Ok(Some(Packet::error(format!(
+                            "Failed to set clipboard: {}",
+                            e
+                        ))));
                     }
 
                     info!("✅ Clipboard text updated");
@@ -439,12 +473,19 @@ async fn handle_message(
                 }
                 Err(e) => {
                     error!("❌ Failed to access clipboard: {}", e);
-                    Ok(Some(Packet::error(format!("Failed to access clipboard: {}", e))))
+                    Ok(Some(Packet::error(format!(
+                        "Failed to access clipboard: {}",
+                        e
+                    ))))
                 }
             }
         }
         Message::ClipboardImage { format, data } => {
-            info!("🖼️  Clipboard image received: {} format, {} bytes", format, data.len());
+            info!(
+                "🖼️  Clipboard image received: {} format, {} bytes",
+                format,
+                data.len()
+            );
 
             match Clipboard::new() {
                 Ok(mut clipboard) => {
@@ -456,7 +497,10 @@ async fn handle_message(
 
                     if let Err(e) = clipboard.set_image(image_data) {
                         error!("❌ Failed to set clipboard image: {}", e);
-                        return Ok(Some(Packet::error(format!("Failed to set clipboard image: {}", e))));
+                        return Ok(Some(Packet::error(format!(
+                            "Failed to set clipboard image: {}",
+                            e
+                        ))));
                     }
 
                     info!("✅ Clipboard image updated");
@@ -469,7 +513,10 @@ async fn handle_message(
                 }
                 Err(e) => {
                     error!("❌ Failed to access clipboard: {}", e);
-                    Ok(Some(Packet::error(format!("Failed to access clipboard: {}", e))))
+                    Ok(Some(Packet::error(format!(
+                        "Failed to access clipboard: {}",
+                        e
+                    ))))
                 }
             }
         }
@@ -501,14 +548,22 @@ async fn start_discovery_service(config: &DaemonConfig) -> Result<DiscoveryServi
         .to_string_lossy()
         .to_string();
 
-    service.start_advertising(config.network.port, &hostname).await?;
+    service
+        .start_advertising(config.network.port, &hostname)
+        .await?;
     Ok(service)
 }
 
 async fn setup_tls(config: &DaemonConfig) -> Result<TlsAcceptor> {
-    let cert_path = config.network.cert_file.as_ref()
+    let cert_path = config
+        .network
+        .cert_file
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("TLS enabled but no cert file specified"))?;
-    let key_path = config.network.key_file.as_ref()
+    let key_path = config
+        .network
+        .key_file
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("TLS enabled but no key file specified"))?;
 
     if !cert_path.exists() || !key_path.exists() {
