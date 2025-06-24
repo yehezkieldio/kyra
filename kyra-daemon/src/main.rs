@@ -67,6 +67,8 @@ async fn handle_connection(
             .as_millis()
     );
 
+    println!("Client ID: {}", client_id);
+
     loop {
         line.clear();
         match reader.read_line(&mut line).await? {
@@ -265,7 +267,7 @@ async fn handle_message(
 
             notifica::notify("Kyra", "Clipboard text updated!").unwrap();
 
-            Ok(None)
+            Ok(Some(Packet::pong()))
         }
         Message::Error(ref err) => {
             println!("Received Error: {}", err);
