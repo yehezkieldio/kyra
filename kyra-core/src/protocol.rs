@@ -1,10 +1,12 @@
-use serde::{Deserialize, Serialize};
 use base64::{Engine as _, engine::general_purpose};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     // Authentication
-    Auth { token: String },
+    Auth {
+        token: String,
+    },
     AuthSuccess,
     AuthFailure,
 
@@ -22,15 +24,17 @@ pub enum Message {
     FileChunk {
         data: Vec<u8>,
         sequence: u64,
-        total_chunks: u64
+        total_chunks: u64,
     },
-    FileComplete { checksum: Option<String> },
+    FileComplete {
+        checksum: Option<String>,
+    },
 
     // Clipboard
     ClipboardText(String),
     ClipboardImage {
         format: String,
-        data: Vec<u8>
+        data: Vec<u8>,
     },
 
     // Text message
@@ -82,12 +86,26 @@ impl Packet {
         Self::new(Message::Pong)
     }
 
-    pub fn file_metadata(name: String, size: u64, checksum: Option<String>, compressed: bool) -> Self {
-        Self::new(Message::FileMetadata { name, size, checksum, compressed })
+    pub fn file_metadata(
+        name: String,
+        size: u64,
+        checksum: Option<String>,
+        compressed: bool,
+    ) -> Self {
+        Self::new(Message::FileMetadata {
+            name,
+            size,
+            checksum,
+            compressed,
+        })
     }
 
     pub fn file_chunk(data: Vec<u8>, sequence: u64, total_chunks: u64) -> Self {
-        Self::new(Message::FileChunk { data, sequence, total_chunks })
+        Self::new(Message::FileChunk {
+            data,
+            sequence,
+            total_chunks,
+        })
     }
 
     pub fn file_complete(checksum: Option<String>) -> Self {

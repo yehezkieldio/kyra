@@ -85,18 +85,21 @@ pub fn sanitize_filename(filename: &str) -> String {
     }
 
     // Remove leading/trailing whitespace and dots
-    sanitized.trim_matches(|c: char| c.is_whitespace() || c == '.').to_string()
+    sanitized
+        .trim_matches(|c: char| c.is_whitespace() || c == '.')
+        .to_string()
 }
 
 pub fn get_file_extension(filename: &str) -> Option<&str> {
-    Path::new(filename)
-        .extension()
-        .and_then(|ext| ext.to_str())
+    Path::new(filename).extension().and_then(|ext| ext.to_str())
 }
 
 pub fn is_image_file(filename: &str) -> bool {
     if let Some(ext) = get_file_extension(filename) {
-        matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tiff")
+        matches!(
+            ext.to_lowercase().as_str(),
+            "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tiff"
+        )
     } else {
         false
     }
