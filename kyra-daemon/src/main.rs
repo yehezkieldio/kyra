@@ -54,16 +54,24 @@ async fn handle_connection(
     stream: TokioTcpStream,
     active_transfers: ActiveTransfers,
 ) -> Result<()> {
+    let peer_addr = stream.peer_addr()?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = TokioBufReader::new(read_half);
     let mut line = String::new();
-    let client_id = format!("{:?}", std::thread::current().id());
+    let client_id = format!(
+        "{}_{}",
+        peer_addr,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
 
     loop {
         line.clear();
         match reader.read_line(&mut line).await? {
             0 => {
-                println!("Client disconnected");
+                println!("Client disconnected: {}", peer_addr);
                 // Clean up any active transfers for this client
                 let mut transfers = active_transfers.lock().await;
                 transfers.remove(&client_id);
@@ -77,7 +85,7 @@ async fn handle_connection(
 
                 match serde_json::from_str::<Packet>(trimmed) {
                     Ok(packet) => {
-                        println!("Received packet: {:?}", packet);
+                        println!("Received packet from {}: {:?}", peer_addr, packet);
 
                         let response =
                             match handle_message(packet.message, &client_id, &active_transfers)
@@ -85,30 +93,72 @@ async fn handle_connection(
                             {
                                 Ok(response_msg) => response_msg,
                                 Err(e) => {
-                                    eprintln!("Error handling message: {}", e);
+                                    eprintln!("Error handling message from {}: {}", peer_addr, e);
                                     Some(Packet::error(format!("Error: {}", e)))
                                 }
                             };
 
                         if let Some(response) = response {
                             let response_json = serde_json::to_string(&response)?;
-                            write_half.write_all(response_json.as_bytes()).await?;
-                            write_half.write_all(b"\n").await?;
-                            write_half.flush().await?;
+                            // Handle broken pipe gracefully
+                            if let Err(e) = write_half.write_all(response_json.as_bytes()).await {
+                                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                                    println!("Client {} disconnected during response", peer_addr);
+                                    break;
+                                }
+                                return Err(e.into());
+                            }
+                            if let Err(e) = write_half.write_all(b"\n").await {
+                                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                                    println!("Client {} disconnected during response", peer_addr);
+                                    break;
+                                }
+                                return Err(e.into());
+                            }
+                            if let Err(e) = write_half.flush().await {
+                                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                                    println!("Client {} disconnected during response", peer_addr);
+                                    break;
+                                }
+                                return Err(e.into());
+                            }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to deserialize message: {}", e);
+                        eprintln!("Failed to deserialize message from {}: {}", peer_addr, e);
                         let error_packet = Packet::error(format!("Invalid message format: {}", e));
                         let error_json = serde_json::to_string(&error_packet)?;
-                        write_half.write_all(error_json.as_bytes()).await?;
-                        write_half.write_all(b"\n").await?;
-                        write_half.flush().await?;
+                        // Handle broken pipe gracefully
+                        if let Err(write_err) = write_half.write_all(error_json.as_bytes()).await {
+                            if write_err.kind() == std::io::ErrorKind::BrokenPipe {
+                                println!("Client {} disconnected during error response", peer_addr);
+                                break;
+                            }
+                            return Err(write_err.into());
+                        }
+                        if let Err(write_err) = write_half.write_all(b"\n").await {
+                            if write_err.kind() == std::io::ErrorKind::BrokenPipe {
+                                println!("Client {} disconnected during error response", peer_addr);
+                                break;
+                            }
+                            return Err(write_err.into());
+                        }
+                        if let Err(write_err) = write_half.flush().await {
+                            if write_err.kind() == std::io::ErrorKind::BrokenPipe {
+                                println!("Client {} disconnected during error response", peer_addr);
+                                break;
+                            }
+                            return Err(write_err.into());
+                        }
                     }
                 }
             }
         }
     }
+
+    // Clean up transfers when connection ends
+    let mut transfers = active_transfers.lock().await;
+    transfers.remove(&client_id);
 
     Ok(())
 }
@@ -164,6 +214,7 @@ async fn handle_message(
             if let Some(transfer) = transfers.get_mut(client_id) {
                 // Write chunk to file
                 transfer.file.write_all(&data)?;
+                transfer.file.flush()?;
                 transfer.received += data.len() as u64;
 
                 let progress = (transfer.received as f64 / transfer.size as f64) * 100.0;
