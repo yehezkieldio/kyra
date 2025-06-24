@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
-use kyra_core::{AgentConfig, CHUNK_SIZE, Message, Packet};
+use kyra_core::{AgentConfig, CHUNK_SIZE, DiscoveryService, Message, Packet, generate_auth_token};
 use serde_json;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
@@ -22,21 +23,40 @@ async fn main() -> Result<()> {
 
     match matches.subcommand() {
         Some(("discover", _)) => {
-            info!("Discovery functionality not yet implemented");
+            discover_peers(&config).await?;
         }
-        Some(("ping", _ping_matches)) => {
-            send_ping(&config).await?;
+        Some(("ping", ping_matches)) => {
+            let host = ping_matches.get_one::<String>("host");
+            send_ping(&config, host).await?;
         }
-        Some(("send", send_matches)) => {
-            if let Some(file_path) = send_matches.get_one::<String>("file") {
-                send_file(file_path, &config).await?;
-            } else {
-                error!("No file specified for send command");
+        Some(("send", send_matches)) => match send_matches.subcommand() {
+            Some(("file", file_matches)) => {
+                let file_path = file_matches.get_one::<String>("path").unwrap();
+                let host = file_matches.get_one::<String>("host");
+                send_file(file_path, &config, host).await?;
             }
-        }
-        Some(("auth", _auth_matches)) => {
-            info!("Auth functionality not yet implemented");
-        }
+            Some(("clipboard", clipboard_matches)) => {
+                let host = clipboard_matches.get_one::<String>("host");
+                send_clipboard(&config, host).await?;
+            }
+            Some(("text", text_matches)) => {
+                let message = text_matches.get_one::<String>("message").unwrap();
+                let host = text_matches.get_one::<String>("host");
+                send_text_message(message, &config, host).await?;
+            }
+            _ => {
+                error!("No valid send subcommand specified. Use 'file', 'clipboard', or 'text'");
+            }
+        },
+        Some(("auth", auth_matches)) => match auth_matches.subcommand() {
+            Some(("generate-token", token_matches)) => {
+                let passphrase = token_matches.get_one::<String>("passphrase").unwrap();
+                generate_token(passphrase)?;
+            }
+            _ => {
+                error!("No valid auth subcommand specified. Use 'generate-token'");
+            }
+        },
         _ => {
             error!("No command specified. Use --help for usage information");
         }
@@ -145,10 +165,11 @@ fn init_logging(config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
-async fn send_ping(config: &AgentConfig) -> Result<()> {
+async fn send_ping(config: &AgentConfig, host: Option<&String>) -> Result<()> {
     info!("Starting Kyra Agent - Ping...");
 
-    let addr = format!("{}:{}", config.network.host, config.network.port);
+    let target_host = host.map(|h| h.as_str()).unwrap_or(&config.network.host);
+    let addr = format!("{}:{}", target_host, config.network.port);
     info!("Connecting to daemon at {}", addr);
 
     let mut stream = TcpStream::connect(&addr)
@@ -172,7 +193,7 @@ async fn send_ping(config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
-async fn send_file(file_path: &str, config: &AgentConfig) -> Result<()> {
+async fn send_file(file_path: &str, config: &AgentConfig, host: Option<&String>) -> Result<()> {
     info!("Starting Kyra Agent - File Transfer...");
 
     let path = Path::new(file_path);
@@ -193,7 +214,8 @@ async fn send_file(file_path: &str, config: &AgentConfig) -> Result<()> {
 
     info!("Sending file: {} ({} bytes)", file_name, file_size);
 
-    let addr = format!("{}:{}", config.network.host, config.network.port);
+    let target_host = host.map(|h| h.as_str()).unwrap_or(&config.network.host);
+    let addr = format!("{}:{}", target_host, config.network.port);
     let mut stream = TcpStream::connect(&addr)
         .await
         .context("Failed to connect to daemon")?;
@@ -301,19 +323,72 @@ async fn send_file(file_path: &str, config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn send_clipboard_text(text: &str, config: &AgentConfig) -> Result<()> {
-    info!("Starting Kyra Agent - Clipboard Transfer...");
+async fn discover_peers(_config: &AgentConfig) -> Result<()> {
+    info!("Starting peer discovery...");
 
-    let addr = format!("{}:{}", config.network.host, config.network.port);
+    let mut discovery = DiscoveryService::new("kyra-agent".to_string())?;
+    let peers = discovery.discover_peers(Duration::from_secs(5)).await?;
+
+    if peers.is_empty() {
+        info!("No Kyra peers found on the network");
+    } else {
+        info!("Found {} Kyra peer(s):", peers.len());
+        for peer in peers {
+            info!("  - {} at {}:{}", peer.name, peer.host, peer.port);
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_text_message(
+    message: &str,
+    config: &AgentConfig,
+    host: Option<&String>,
+) -> Result<()> {
+    info!("Starting Kyra Agent - Text Message...");
+
+    let target_host = host.map(|h| h.as_str()).unwrap_or(&config.network.host);
+    let addr = format!("{}:{}", target_host, config.network.port);
     let mut stream = TcpStream::connect(&addr)
         .await
         .context("Failed to connect to daemon")?;
-    info!("Connected to daemon!");
+    info!("Connected to daemon at {}!", addr);
 
-    let clipboard_packet = Packet::clipboard_text(text.to_string());
+    let text_packet = Packet::text_message(message.to_string());
+    send_packet(&mut stream, &text_packet).await?;
+    info!("Sent text message ({} characters)", message.len());
+
+    // Wait for acknowledgment
+    let response = receive_packet(&mut stream).await?;
+    match response.message {
+        Message::Pong => info!("Text message sent successfully!"),
+        Message::Error(err) => error!("Daemon returned error: {}", err),
+        _ => warn!("Unexpected response: {:?}", response.message),
+    }
+
+    Ok(())
+}
+
+async fn send_clipboard(config: &AgentConfig, host: Option<&String>) -> Result<()> {
+    info!("Starting Kyra Agent - Clipboard Transfer...");
+
+    // Try to get clipboard content
+    let clipboard_text = get_clipboard_content()?;
+    if clipboard_text.is_empty() {
+        return Err(anyhow::anyhow!("Clipboard is empty"));
+    }
+
+    let target_host = host.map(|h| h.as_str()).unwrap_or(&config.network.host);
+    let addr = format!("{}:{}", target_host, config.network.port);
+    let mut stream = TcpStream::connect(&addr)
+        .await
+        .context("Failed to connect to daemon")?;
+    info!("Connected to daemon at {}!", addr);
+
+    let clipboard_packet = Packet::clipboard_text(clipboard_text.clone());
     send_packet(&mut stream, &clipboard_packet).await?;
-    info!("Sent clipboard text ({} characters)", text.len());
+    info!("Sent clipboard text ({} characters)", clipboard_text.len());
 
     // Wait for acknowledgment
     let response = receive_packet(&mut stream).await?;
@@ -323,6 +398,57 @@ async fn send_clipboard_text(text: &str, config: &AgentConfig) -> Result<()> {
         _ => warn!("Unexpected response: {:?}", response.message),
     }
 
+    Ok(())
+}
+
+fn get_clipboard_content() -> Result<String> {
+    // Try different clipboard commands based on the system
+    use std::process::Command;
+
+    // Try xclip first (common on Linux)
+    if let Ok(output) = Command::new("xclip")
+        .args(&["-selection", "clipboard", "-o"])
+        .output()
+    {
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        }
+    }
+
+    // Try xsel as alternative
+    if let Ok(output) = Command::new("xsel")
+        .args(&["--clipboard", "--output"])
+        .output()
+    {
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        }
+    }
+
+    // Try wl-paste for Wayland
+    if let Ok(output) = Command::new("wl-paste").output() {
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        }
+    }
+
+    // Try pbpaste for macOS
+    if let Ok(output) = Command::new("pbpaste").output() {
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Unable to access clipboard. Please install xclip, xsel, wl-paste, or pbpaste"
+    ))
+}
+
+fn generate_token(passphrase: &str) -> Result<()> {
+    let token = generate_auth_token(passphrase);
+    println!("Generated authentication token:");
+    println!("{}", token);
+    println!("\nThis token can be used for secure authentication between Kyra instances.");
     Ok(())
 }
 
