@@ -1,4 +1,5 @@
 use anyhow::Result;
+use arboard::Clipboard;
 use kyra_core::{DEFAULT_HOST, DEFAULT_PORT, Message, Packet};
 use serde_json;
 use std::collections::HashMap;
@@ -209,6 +210,10 @@ async fn handle_message(
 
             // In a real implementation, might want to set the system clipboard here
             // For now, we'll just acknowledge receipt
+            let mut clipboard = Clipboard::new().unwrap();
+            clipboard.set_text(text).unwrap();
+            println!("Clipboard text set successfully");
+
             Ok(Some(Packet::pong()))
         }
         Message::Error(ref err) => {
