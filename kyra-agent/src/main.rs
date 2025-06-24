@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
-use kyra_core::{AgentConfig, CHUNK_SIZE, Message, Packet};
+use kyra_core::{
+    AgentConfig, CHUNK_SIZE, Message, Packet
+};
 use serde_json;
 use std::fs::File;
 use std::io::Read;
@@ -12,60 +14,117 @@ use tracing_subscriber::fmt;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let matches = build_cli().get_matches();
+
     // Load configuration
     let config = AgentConfig::load()?;
 
     // Initialize logging
     init_logging(&config)?;
 
-    let matches = Command::new("kyra-agent")
-        .about("Kyra Agent - Client for data transfer")
-        .subcommand(Command::new("ping").about("Send a ping to the daemon"))
-        .subcommand(
-            Command::new("send")
-                .about("Send data")
-                .subcommand(
-                    Command::new("file").about("Send a file").arg(
-                        Arg::new("path")
-                            .help("Path to the file to send")
-                            .required(true)
-                            .index(1),
-                    ),
-                )
-                .subcommand(
-                    Command::new("clipboard").about("Send clipboard text").arg(
-                        Arg::new("text")
-                            .help("Text to send")
-                            .required(true)
-                            .index(1),
-                    ),
-                ),
-        )
-        .get_matches();
-
     match matches.subcommand() {
-        Some(("ping", _)) => {
+        Some(("discover", _)) => {
+            info!("Discovery functionality not yet implemented");
+        }
+        Some(("ping", _ping_matches)) => {
             send_ping(&config).await?;
         }
-        Some(("send", send_matches)) => match send_matches.subcommand() {
-            Some(("file", file_matches)) => {
-                let file_path = file_matches.get_one::<String>("path").unwrap();
+        Some(("send", send_matches)) => {
+            if let Some(file_path) = send_matches.get_one::<String>("file") {
                 send_file(file_path, &config).await?;
+            } else {
+                error!("No file specified for send command");
             }
-            Some(("clipboard", clipboard_matches)) => {
-                let text = clipboard_matches.get_one::<String>("text").unwrap();
-                send_clipboard_text(text, &config).await?;
-            }
-            _ => {
-                error!("Unknown send command. Use 'file' or 'clipboard'");
-            }
-        },
+        }
+        Some(("auth", _auth_matches)) => {
+            info!("Auth functionality not yet implemented");
+        }
         _ => {
-            error!("No command specified. Use 'ping' or 'send'");
+            error!("No command specified. Use --help for usage information");
         }
     }
 
     Ok(())
+}
+
+fn build_cli() -> Command {
+    Command::new("kyra-agent")
+        .version("0.1.0")
+        .about("Kyra Agent - Secure cross-platform data transfer client")
+        .subcommand(
+            Command::new("discover")
+                .about("Discover Kyra peers on the network")
+        )
+        .subcommand(
+            Command::new("ping")
+                .about("Send a ping to test connectivity")
+                .arg(
+                    Arg::new("host")
+                        .help("Specific host to ping (optional, will use discovery)")
+                        .long("host")
+                        .value_name("HOST")
+                )
+        )
+        .subcommand(
+            Command::new("send")
+                .about("Send data to a peer")
+                .subcommand(
+                    Command::new("file")
+                        .about("Send a file")
+                        .arg(
+                            Arg::new("path")
+                                .help("Path to the file to send")
+                                .required(true)
+                                .index(1)
+                        )
+                        .arg(
+                            Arg::new("host")
+                                .help("Target host")
+                                .long("host")
+                                .value_name("HOST")
+                        )
+                )
+                .subcommand(
+                    Command::new("clipboard")
+                        .about("Send clipboard content")
+                        .arg(
+                            Arg::new("host")
+                                .help("Target host")
+                                .long("host")
+                                .value_name("HOST")
+                        )
+                )
+                .subcommand(
+                    Command::new("text")
+                        .about("Send text message")
+                        .arg(
+                            Arg::new("message")
+                                .help("Text message to send")
+                                .required(true)
+                                .index(1)
+                        )
+                        .arg(
+                            Arg::new("host")
+                                .help("Target host")
+                                .long("host")
+                                .value_name("HOST")
+                        )
+                )
+        )
+        .subcommand(
+            Command::new("auth")
+                .about("Authentication utilities")
+                .subcommand(
+                    Command::new("generate-token")
+                        .about("Generate authentication token from passphrase")
+                        .arg(
+                            Arg::new("passphrase")
+                                .help("Passphrase to generate token from")
+                                .required(true)
+                                .index(1)
+                        )
+                )
+        )
 }
 
 fn init_logging(config: &AgentConfig) -> Result<()> {
@@ -146,7 +205,7 @@ async fn send_file(file_path: &str, config: &AgentConfig) -> Result<()> {
     info!("Connected to daemon!");
 
     // Send file metadata
-    let metadata_packet = Packet::file_metadata(file_name.clone(), file_size);
+    let metadata_packet = Packet::file_metadata(file_name.clone(), file_size, None, false);
     send_packet(&mut stream, &metadata_packet).await?;
     info!("Sent file metadata: {} ({} bytes)", file_name, file_size);
 
@@ -177,6 +236,8 @@ async fn send_file(file_path: &str, config: &AgentConfig) -> Result<()> {
     let mut file = File::open(path).context("Failed to open file")?;
     let mut buffer = vec![0u8; CHUNK_SIZE];
     let mut bytes_sent = 0u64;
+    let mut sequence = 0u64;
+    let total_chunks = (file_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64; // Calculate total chunks
 
     loop {
         let bytes_read = file.read(&mut buffer).context("Failed to read file")?;
@@ -186,7 +247,7 @@ async fn send_file(file_path: &str, config: &AgentConfig) -> Result<()> {
         }
 
         let chunk = buffer[..bytes_read].to_vec();
-        let chunk_packet = Packet::file_chunk(chunk);
+        let chunk_packet = Packet::file_chunk(chunk, sequence, total_chunks);
         // Send chunk directly to writer without using send_packet
         let json = serde_json::to_string(&chunk_packet).context("Failed to serialize chunk")?;
         writer
@@ -200,6 +261,7 @@ async fn send_file(file_path: &str, config: &AgentConfig) -> Result<()> {
         writer.flush().await.context("Failed to flush stream")?;
 
         bytes_sent += bytes_read as u64;
+        sequence += 1;
         let progress = (bytes_sent as f64 / file_size as f64) * 100.0;
         debug!(
             "Sent chunk: {} / {} bytes ({:.1}%)",
@@ -208,7 +270,7 @@ async fn send_file(file_path: &str, config: &AgentConfig) -> Result<()> {
     }
 
     // Send completion signal
-    let complete_packet = Packet::file_complete();
+    let complete_packet = Packet::file_complete(None);
     let json = serde_json::to_string(&complete_packet).context("Failed to serialize completion")?;
     writer
         .write_all(json.as_bytes())

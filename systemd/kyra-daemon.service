@@ -1,0 +1,53 @@
+[Unit]
+Description=Kyra Daemon - Secure Cross-Platform Data Transfer Service
+Documentation=https://github.com/kyra/kyra
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kyra
+Group=kyra
+ExecStart=/usr/local/bin/kyra-daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kyra-daemon
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/home/kyra/.config/kyra /home/kyra/Downloads /var/log/kyra
+PrivateTmp=true
+PrivateDevices=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+RestrictNamespaces=true
+
+# Network restrictions
+IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16
+IPAddressDeny=any
+
+# File system restrictions
+ProtectProc=noaccess
+ProcSubset=pid
+
+# Capabilities
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -1,14 +1,20 @@
 use anyhow::Result;
-use arboard::Clipboard;
-use kyra_core::{DaemonConfig, Message, Packet};
+use arboard::{Clipboard, ImageData};
+use kyra_core::{
+    DaemonConfig, DiscoveryService, Message, Packet,
+    generate_checksum, is_host_allowed, load_tls_server_config,
+    sanitize_filename, format_bytes, ensure_dir_exists
+};
 use serde_json;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::fmt;
 
@@ -18,9 +24,21 @@ struct FileTransfer {
     size: u64,
     received: u64,
     file: File,
+    checksum: Option<String>,
+    chunks_received: u64,
+    total_chunks: u64,
+    start_time: std::time::Instant,
 }
 
-type ActiveTransfers = Arc<Mutex<HashMap<String, FileTransfer>>>;
+#[derive(Debug)]
+struct ClientSession {
+    id: String,
+    addr: SocketAddr,
+    authenticated: bool,
+    file_transfer: Option<FileTransfer>,
+}
+
+type ActiveSessions = Arc<Mutex<HashMap<String, ClientSession>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,30 +48,100 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&config)?;
 
-    info!("Starting Kyra Daemon...");
+    info!("🚀 Starting Kyra Daemon v0.1.0");
     info!("Configuration loaded: {:?}", config);
 
+    // Ensure download directory exists
+    ensure_dir_exists(&config.storage.download_dir).await?;
+
+    // Start mDNS discovery service if enabled
+    let _discovery_service = if config.discovery.enable_mdns {
+        match start_discovery_service(&config).await {
+            Ok(service) => {
+                info!("✅ mDNS discovery service started");
+                Some(service)
+            }
+            Err(e) => {
+                warn!("⚠️  Failed to start mDNS discovery: {}", e);
+                None
+            }
+        }
+    } else {
+        info!("🔍 mDNS discovery disabled");
+        None
+    };
+
+    // Setup TLS if enabled
+    let tls_acceptor = if config.network.enable_tls {
+        Some(setup_tls(&config).await?)
+    } else {
+        None
+    };
+
     let addr = format!("{}:{}", config.network.host, config.network.port);
-    let listener = TokioTcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&addr).await?;
 
-    info!("Daemon listening on {}", addr);
+    info!("🎯 Daemon listening on {}", addr);
+    if config.network.enable_tls {
+        info!("🔒 TLS encryption enabled");
+    }
+    if config.security.require_auth {
+        info!("🛡️  Authentication required");
+    }
 
-    let active_transfers: ActiveTransfers = Arc::new(Mutex::new(HashMap::new()));
+    let active_sessions: ActiveSessions = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                info!("New connection from: {}", addr);
-                let transfers = active_transfers.clone();
+                info!("🔌 New connection from: {}", addr);
+
+                // Check if host is allowed
+                if !is_host_allowed(&addr.ip().to_string(), &config.security.allowed_hosts) {
+                    warn!("🚫 Rejected connection from unauthorized host: {}", addr);
+                    continue;
+                }
+
+                let sessions = active_sessions.clone();
                 let config = config.clone();
+                let tls_acceptor = tls_acceptor.clone();
+
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, transfers, config).await {
-                        error!("Error handling connection from {}: {}", addr, e);
+                    let session_id = uuid::Uuid::new_v4().to_string();
+
+                    // Insert new session
+                    {
+                        let mut sessions_guard = sessions.lock().await;
+                        sessions_guard.insert(session_id.clone(), ClientSession {
+                            id: session_id.clone(),
+                            addr,
+                            authenticated: !config.security.require_auth,
+                            file_transfer: None,
+                        });
+                    }
+
+                    let result = if let Some(ref acceptor) = tls_acceptor {
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                info!("🔐 TLS handshake completed for {}", addr);
+                                handle_connection_tls(tls_stream, session_id, sessions, config).await
+                            }
+                            Err(e) => {
+                                error!("❌ TLS handshake failed for {}: {}", addr, e);
+                                Err(e.into())
+                            }
+                        }
+                    } else {
+                        handle_connection_plain(stream, session_id, sessions, config).await
+                    };
+
+                    if let Err(e) = result {
+                        error!("❌ Error handling connection from {}: {}", addr, e);
                     }
                 });
             }
             Err(e) => {
-                error!("Error accepting connection: {}", e);
+                error!("❌ Error accepting connection: {}", e);
             }
         }
     }
@@ -82,36 +170,47 @@ fn init_logging(config: &DaemonConfig) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(
-    stream: TokioTcpStream,
-    active_transfers: ActiveTransfers,
+async fn handle_connection_plain(
+    stream: TcpStream,
+    session_id: String,
+    sessions: ActiveSessions,
     config: DaemonConfig,
 ) -> Result<()> {
-    let peer_addr = stream.peer_addr()?;
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, write_half) = stream.into_split();
+    handle_connection_impl(read_half, write_half, session_id, sessions, config).await
+}
+
+async fn handle_connection_tls(
+    stream: TlsStream<TcpStream>,
+    session_id: String,
+    sessions: ActiveSessions,
+    config: DaemonConfig,
+) -> Result<()> {
+    let (read_half, write_half) = tokio::io::split(stream);
+    handle_connection_impl(read_half, write_half, session_id, sessions, config).await
+}
+
+async fn handle_connection_impl<R, W>(
+    read_half: R,
+    mut write_half: W,
+    session_id: String,
+    sessions: ActiveSessions,
+    config: DaemonConfig,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut reader = TokioBufReader::new(read_half);
     let mut line = String::new();
-    let client_id = format!(
-        "{}_{}",
-        peer_addr,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    );
 
-    info!("Client connected with ID: {}", client_id);
+    info!("📡 Client session started: {}", session_id);
 
     loop {
         line.clear();
         match reader.read_line(&mut line).await? {
             0 => {
-                info!("Client disconnected: {}", peer_addr);
-                // Clean up any active transfers for this client
-                let mut transfers = active_transfers.lock().await;
-                if transfers.remove(&client_id).is_some() {
-                    warn!("Cleaned up incomplete transfer for client: {}", client_id);
-                }
+                info!("👋 Client disconnected: {}", session_id);
                 break;
             }
             _ => {
@@ -120,178 +219,197 @@ async fn handle_connection(
                     continue;
                 }
 
-                debug!("Raw message from {}: {}", peer_addr, trimmed);
+                debug!("📨 Raw message: {}", trimmed);
 
                 match serde_json::from_str::<Packet>(trimmed) {
                     Ok(packet) => {
-                        debug!("Received packet from {}: {:?}", peer_addr, packet.message);
+                        debug!("📦 Received packet: {:?}", packet.message);
 
-                        let response = match handle_message(
-                            packet.message,
-                            &client_id,
-                            &active_transfers,
+                        let response = handle_message(
+                            packet,
+                            &session_id,
+                            &sessions,
                             &config,
-                        )
-                        .await
-                        {
-                            Ok(response_msg) => response_msg,
-                            Err(e) => {
-                                error!("Error handling message from {}: {}", peer_addr, e);
-                                Some(Packet::error(format!("Error: {}", e)))
-                            }
-                        };
+                        ).await;
 
-                        if let Some(response) = response {
-                            let response_json = serde_json::to_string(&response)?;
-                            // Handle broken pipe gracefully
-                            if let Err(e) = write_half.write_all(response_json.as_bytes()).await {
-                                if e.kind() == std::io::ErrorKind::BrokenPipe {
-                                    info!("Client {} disconnected during response", peer_addr);
-                                    break;
-                                }
-                                return Err(e.into());
+                        match response {
+                            Ok(Some(response_packet)) => {
+                                let response_json = serde_json::to_string(&response_packet)?;
+                                write_half.write_all(response_json.as_bytes()).await?;
+                                write_half.write_all(b"\n").await?;
+                                write_half.flush().await?;
                             }
-                            if let Err(e) = write_half.write_all(b"\n").await {
-                                if e.kind() == std::io::ErrorKind::BrokenPipe {
-                                    info!("Client {} disconnected during response", peer_addr);
-                                    break;
-                                }
-                                return Err(e.into());
+                            Ok(None) => {
+                                // No response needed
                             }
-                            if let Err(e) = write_half.flush().await {
-                                if e.kind() == std::io::ErrorKind::BrokenPipe {
-                                    info!("Client {} disconnected during response", peer_addr);
-                                    break;
-                                }
-                                return Err(e.into());
+                            Err(e) => {
+                                error!("❌ Error handling message: {}", e);
+                                let error_packet = Packet::error(format!("Error: {}", e));
+                                let error_json = serde_json::to_string(&error_packet)?;
+                                write_half.write_all(error_json.as_bytes()).await?;
+                                write_half.write_all(b"\n").await?;
+                                write_half.flush().await?;
                             }
                         }
                     }
                     Err(e) => {
-                        error!("Failed to deserialize message from {}: {}", peer_addr, e);
+                        error!("❌ Failed to deserialize message: {}", e);
                         let error_packet = Packet::error(format!("Invalid message format: {}", e));
                         let error_json = serde_json::to_string(&error_packet)?;
-                        // Handle broken pipe gracefully
-                        if let Err(write_err) = write_half.write_all(error_json.as_bytes()).await {
-                            if write_err.kind() == std::io::ErrorKind::BrokenPipe {
-                                info!("Client {} disconnected during error response", peer_addr);
-                                break;
-                            }
-                            return Err(write_err.into());
-                        }
-                        if let Err(write_err) = write_half.write_all(b"\n").await {
-                            if write_err.kind() == std::io::ErrorKind::BrokenPipe {
-                                info!("Client {} disconnected during error response", peer_addr);
-                                break;
-                            }
-                            return Err(write_err.into());
-                        }
-                        if let Err(write_err) = write_half.flush().await {
-                            if write_err.kind() == std::io::ErrorKind::BrokenPipe {
-                                info!("Client {} disconnected during error response", peer_addr);
-                                break;
-                            }
-                            return Err(write_err.into());
-                        }
+                        write_half.write_all(error_json.as_bytes()).await?;
+                        write_half.write_all(b"\n").await?;
+                        write_half.flush().await?;
                     }
                 }
             }
         }
     }
 
-    // Clean up transfers when connection ends
-    let mut transfers = active_transfers.lock().await;
-    transfers.remove(&client_id);
+    // Clean up session
+    {
+        let mut sessions_guard = sessions.lock().await;
+        sessions_guard.remove(&session_id);
+    }
 
     Ok(())
 }
 
 async fn handle_message(
-    message: Message,
-    client_id: &str,
-    active_transfers: &ActiveTransfers,
+    packet: Packet,
+    session_id: &str,
+    sessions: &ActiveSessions,
     config: &DaemonConfig,
 ) -> Result<Option<Packet>> {
-    match message {
+    let mut sessions_guard = sessions.lock().await;
+    let session = sessions_guard.get_mut(session_id)
+        .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+
+    match packet.message {
+        Message::Auth { token } => {
+            if let Some(expected_token) = &config.security.auth_token {
+                if kyra_core::verify_auth_token(&token, expected_token) {
+                    session.authenticated = true;
+                    info!("✅ Authentication successful for session {}", session_id);
+                    Ok(Some(Packet::auth_success()))
+                } else {
+                    warn!("🚫 Authentication failed for session {}", session_id);
+                    Ok(Some(Packet::auth_failure()))
+                }
+            } else {
+                // No auth token configured, accept any auth attempt
+                session.authenticated = true;
+                Ok(Some(Packet::auth_success()))
+            }
+        }
+        _ if config.security.require_auth && !session.authenticated => {
+            warn!("🚫 Unauthenticated request from session {}", session_id);
+            Ok(Some(Packet::error("Authentication required".to_string())))
+        }
         Message::Ping => {
-            debug!("Received Ping from {}, sending Pong", client_id);
+            debug!("🏓 Ping from session {}", session_id);
             Ok(Some(Packet::pong()))
         }
         Message::Pong => {
-            debug!("Received Pong from {}", client_id);
+            debug!("🏓 Pong from session {}", session_id);
             Ok(None)
         }
-        Message::FileMetadata { name, size } => {
-            info!(
-                "Starting file transfer from {}: {} ({} bytes)",
-                client_id, name, size
-            );
+        Message::FileMetadata { name, size, checksum, compressed: _ } => {
+            if size > config.storage.max_file_size {
+                return Ok(Some(Packet::error(format!(
+                    "File too large: {} > {}",
+                    format_bytes(size),
+                    format_bytes(config.storage.max_file_size)
+                ))));
+            }
 
-            // Use configured download directory
-            let downloads_dir = &config.storage.download_dir;
-            std::fs::create_dir_all(downloads_dir)?;
+            let sanitized_name = sanitize_filename(&name);
+            let file_path = config.storage.download_dir.join(&sanitized_name);
 
-            // Create file path
-            let file_path = downloads_dir.join(&name);
+            info!("📁 Starting file transfer: {} ({}) -> {}",
+                  name, format_bytes(size), file_path.display());
 
-            // Create/truncate the file
             let file = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&file_path)?;
 
-            // Store the transfer info
             let transfer = FileTransfer {
-                name: name.clone(),
+                name: sanitized_name,
                 size,
                 received: 0,
                 file,
+                checksum,
+                chunks_received: 0,
+                total_chunks: 0,
+                start_time: std::time::Instant::now(),
             };
 
-            let mut transfers = active_transfers.lock().await;
-            transfers.insert(client_id.to_string(), transfer);
-
-            info!("Ready to receive file: {} -> {:?}", name, file_path);
-            Ok(Some(Packet::pong())) // Acknowledge metadata
+            session.file_transfer = Some(transfer);
+            Ok(Some(Packet::success("Ready to receive file".to_string())))
         }
-        Message::FileChunk(data) => {
-            let mut transfers = active_transfers.lock().await;
-
-            if let Some(transfer) = transfers.get_mut(client_id) {
-                // Write chunk to file
+        Message::FileChunk { data, sequence, total_chunks } => {
+            if let Some(transfer) = &mut session.file_transfer {
                 transfer.file.write_all(&data)?;
                 transfer.file.flush()?;
                 transfer.received += data.len() as u64;
+                transfer.chunks_received += 1;
+                transfer.total_chunks = total_chunks;
 
                 let progress = (transfer.received as f64 / transfer.size as f64) * 100.0;
-                debug!(
-                    "Received chunk for {} from {}: {} / {} bytes ({:.1}%)",
-                    transfer.name, client_id, transfer.received, transfer.size, progress
-                );
-                Ok(None) // Don't send response for chunks
+                let elapsed = transfer.start_time.elapsed();
+                let speed = transfer.received as f64 / elapsed.as_secs_f64();
+
+                debug!("📊 File chunk {}/{}: {} / {} ({:.1}%) at {}/s",
+                       sequence, total_chunks,
+                       format_bytes(transfer.received),
+                       format_bytes(transfer.size),
+                       progress,
+                       format_bytes(speed as u64));
+
+                Ok(None)
             } else {
-                Err(anyhow::anyhow!("No active file transfer for this client"))
+                Err(anyhow::anyhow!("No active file transfer"))
             }
         }
-        Message::FileComplete => {
-            let mut transfers = active_transfers.lock().await;
-
-            if let Some(transfer) = transfers.remove(client_id) {
-                // Flush and close file
+        Message::FileComplete { checksum } => {
+            if let Some(transfer) = session.file_transfer.take() {
                 drop(transfer.file);
 
+                let elapsed = transfer.start_time.elapsed();
+                let speed = transfer.received as f64 / elapsed.as_secs_f64();
+
                 if transfer.received == transfer.size {
-                    info!(
-                        "File transfer completed successfully from {}: {} ({} bytes)",
-                        client_id, transfer.name, transfer.received
-                    );
-                    Ok(Some(Packet::pong()))
+                    info!("✅ File transfer completed: {} ({}) in {:.1}s at {}/s",
+                          transfer.name,
+                          format_bytes(transfer.received),
+                          elapsed.as_secs_f64(),
+                          format_bytes(speed as u64));
+
+                    // Verify checksum if provided
+                    if let Some(expected_checksum) = checksum {
+                        let file_path = config.storage.download_dir.join(&transfer.name);
+                        let file_data = std::fs::read(&file_path)?;
+                        let actual_checksum = generate_checksum(&file_data);
+
+                        if actual_checksum != expected_checksum {
+                            warn!("⚠️  Checksum mismatch for {}: expected {}, got {}",
+                                  transfer.name, expected_checksum, actual_checksum);
+                            return Ok(Some(Packet::error("Checksum verification failed".to_string())));
+                        }
+
+                        info!("✅ Checksum verified for {}", transfer.name);
+                    }
+
+                    // Send notification
+                    if let Err(e) = notifica::notify("Kyra", &format!("File received: {}", transfer.name)) {
+                        warn!("⚠️  Failed to send notification: {}", e);
+                    }
+
+                    Ok(Some(Packet::success("File received successfully".to_string())))
                 } else {
-                    warn!(
-                        "File transfer completed with size mismatch from {}: {} (expected: {}, received: {})",
-                        client_id, transfer.name, transfer.size, transfer.received
-                    );
+                    warn!("⚠️  File size mismatch: expected {}, received {}",
+                          transfer.size, transfer.received);
                     Ok(Some(Packet::error(format!(
                         "Size mismatch: expected {}, received {}",
                         transfer.size, transfer.received
@@ -302,42 +420,113 @@ async fn handle_message(
             }
         }
         Message::ClipboardText(text) => {
-            info!(
-                "Received clipboard text from {}: {} characters",
-                client_id,
-                text.len()
-            );
-            debug!("Clipboard content: {}", text);
+            info!("📋 Clipboard text received: {} characters", text.len());
 
             match Clipboard::new() {
                 Ok(mut clipboard) => {
                     if let Err(e) = clipboard.set_text(text) {
-                        error!("Failed to set clipboard: {}", e);
-                        return Ok(Some(Packet::error(format!(
-                            "Failed to set clipboard: {}",
-                            e
-                        ))));
+                        error!("❌ Failed to set clipboard text: {}", e);
+                        return Ok(Some(Packet::error(format!("Failed to set clipboard: {}", e))));
                     }
-                    info!("Clipboard text set successfully");
+
+                    info!("✅ Clipboard text updated");
 
                     if let Err(e) = notifica::notify("Kyra", "Clipboard text updated!") {
-                        warn!("Failed to send notification: {}", e);
+                        warn!("⚠️  Failed to send notification: {}", e);
                     }
 
-                    Ok(Some(Packet::pong()))
+                    Ok(Some(Packet::success("Clipboard text updated".to_string())))
                 }
                 Err(e) => {
-                    error!("Failed to access clipboard: {}", e);
-                    Ok(Some(Packet::error(format!(
-                        "Failed to access clipboard: {}",
-                        e
-                    ))))
+                    error!("❌ Failed to access clipboard: {}", e);
+                    Ok(Some(Packet::error(format!("Failed to access clipboard: {}", e))))
                 }
             }
         }
+        Message::ClipboardImage { format, data } => {
+            info!("🖼️  Clipboard image received: {} format, {} bytes", format, data.len());
+
+            match Clipboard::new() {
+                Ok(mut clipboard) => {
+                    let image_data = ImageData {
+                        width: 0, // Will be determined by arboard
+                        height: 0,
+                        bytes: data.into(),
+                    };
+
+                    if let Err(e) = clipboard.set_image(image_data) {
+                        error!("❌ Failed to set clipboard image: {}", e);
+                        return Ok(Some(Packet::error(format!("Failed to set clipboard image: {}", e))));
+                    }
+
+                    info!("✅ Clipboard image updated");
+
+                    if let Err(e) = notifica::notify("Kyra", "Clipboard image updated!") {
+                        warn!("⚠️  Failed to send notification: {}", e);
+                    }
+
+                    Ok(Some(Packet::success("Clipboard image updated".to_string())))
+                }
+                Err(e) => {
+                    error!("❌ Failed to access clipboard: {}", e);
+                    Ok(Some(Packet::error(format!("Failed to access clipboard: {}", e))))
+                }
+            }
+        }
+        Message::TextMessage(text) => {
+            info!("💬 Text message received: {}", text);
+
+            if let Err(e) = notifica::notify("Kyra Message", &text) {
+                warn!("⚠️  Failed to send notification: {}", e);
+            }
+
+            Ok(Some(Packet::success("Message received".to_string())))
+        }
         Message::Error(ref err) => {
-            warn!("Received Error from {}: {}", client_id, err);
+            warn!("❌ Error received: {}", err);
             Ok(None)
         }
+        _ => {
+            warn!("❓ Unknown message type received");
+            Ok(Some(Packet::error("Unknown message type".to_string())))
+        }
     }
+}
+
+async fn start_discovery_service(config: &DaemonConfig) -> Result<DiscoveryService> {
+    let service = DiscoveryService::new(config.discovery.service_name.clone())?;
+
+    let hostname = hostname::get()
+        .unwrap_or_else(|_| "kyra-daemon".into())
+        .to_string_lossy()
+        .to_string();
+
+    service.start_advertising(config.network.port, &hostname).await?;
+    Ok(service)
+}
+
+async fn setup_tls(config: &DaemonConfig) -> Result<TlsAcceptor> {
+    let cert_path = config.network.cert_file.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TLS enabled but no cert file specified"))?;
+    let key_path = config.network.key_file.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TLS enabled but no key file specified"))?;
+
+    if !cert_path.exists() || !key_path.exists() {
+        info!("🔑 Generating self-signed certificate...");
+        let hostname = hostname::get()
+            .unwrap_or_else(|_| "localhost".into())
+            .to_string_lossy()
+            .to_string();
+
+        // Ensure cert directory exists
+        if let Some(parent) = cert_path.parent() {
+            ensure_dir_exists(parent).await?;
+        }
+
+        kyra_core::generate_self_signed_cert(cert_path, key_path, &hostname)?;
+        info!("✅ Self-signed certificate generated");
+    }
+
+    let server_config = load_tls_server_config(cert_path, key_path)?;
+    Ok(TlsAcceptor::from(server_config))
 }
