@@ -119,6 +119,29 @@ async fn send_file(file_path: &str) -> Result<()> {
     send_packet(&mut stream, &metadata_packet).await?;
     println!("Sent file metadata: {} ({} bytes)", file_name, file_size);
 
+    // Wait for acknowledgment
+    let (reader, mut writer) = stream.split();
+    let mut reader = TokioBufReader::new(reader);
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .await
+        .context("Failed to read response")?;
+    let trimmed = response.trim();
+    let ack_response =
+        serde_json::from_str::<Packet>(trimmed).context("Failed to deserialize response")?;
+
+    match ack_response.message {
+        Message::Pong => println!("Metadata acknowledged"),
+        Message::Error(err) => return Err(anyhow::anyhow!("Daemon error: {}", err)),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Unexpected response: {:?}",
+                ack_response.message
+            ));
+        }
+    }
+
     // Open file and send chunks
     let mut file = File::open(path).context("Failed to open file")?;
 
@@ -134,7 +157,17 @@ async fn send_file(file_path: &str) -> Result<()> {
 
         let chunk = buffer[..bytes_read].to_vec();
         let chunk_packet = Packet::file_chunk(chunk);
-        send_packet(&mut stream, &chunk_packet).await?;
+        // Send chunk directly to writer without using send_packet
+        let json = serde_json::to_string(&chunk_packet).context("Failed to serialize chunk")?;
+        writer
+            .write_all(json.as_bytes())
+            .await
+            .context("Failed to write chunk")?;
+        writer
+            .write_all(b"\n")
+            .await
+            .context("Failed to write newline")?;
+        writer.flush().await.context("Failed to flush stream")?;
 
         bytes_sent += bytes_read as u64;
         println!(
@@ -147,8 +180,37 @@ async fn send_file(file_path: &str) -> Result<()> {
 
     // Send completion signal
     let complete_packet = Packet::file_complete();
-    send_packet(&mut stream, &complete_packet).await?;
-    println!("File transfer completed!");
+    let json = serde_json::to_string(&complete_packet).context("Failed to serialize completion")?;
+    writer
+        .write_all(json.as_bytes())
+        .await
+        .context("Failed to write completion")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("Failed to write newline")?;
+    writer.flush().await.context("Failed to flush stream")?;
+
+    // Wait for final acknowledgment
+    response.clear();
+    reader
+        .read_line(&mut response)
+        .await
+        .context("Failed to read final response")?;
+    let trimmed = response.trim();
+    let final_response =
+        serde_json::from_str::<Packet>(trimmed).context("Failed to deserialize final response")?;
+
+    match final_response.message {
+        Message::Pong => println!("File transfer completed successfully!"),
+        Message::Error(err) => return Err(anyhow::anyhow!("Daemon error: {}", err)),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Unexpected response: {:?}",
+                final_response.message
+            ));
+        }
+    }
 
     Ok(())
 }
