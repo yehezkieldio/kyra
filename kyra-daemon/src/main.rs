@@ -5,12 +5,12 @@ use serde_json;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::fmt;
 
 #[derive(Debug)]
 struct FileTransfer {
@@ -60,13 +60,7 @@ async fn main() -> Result<()> {
 }
 
 fn init_logging(config: &DaemonConfig) -> Result<()> {
-    use tracing_subscriber::{EnvFilter, fmt};
-
-    let filter =
-        EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(&config.logging.level))?;
-
     let subscriber = fmt()
-        .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(true)
         .with_file(true)
